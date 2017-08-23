@@ -357,6 +357,8 @@ defmodule Mongo.Ecto do
   @behaviour Ecto.Adapter.Storage
   @behaviour Ecto.Adapter.Migration
 
+  alias Ecto.Migration.Table
+  alias Ecto.Migration.Index
   alias Mongo.Ecto.NormalizedQuery
   alias Mongo.Ecto.NormalizedQuery.ReadQuery
   alias Mongo.Ecto.NormalizedQuery.WriteQuery
@@ -365,8 +367,19 @@ defmodule Mongo.Ecto do
   alias Mongo.Ecto.Connection
   alias Mongo.Ecto.Conversions
 
-  ## Adapter
 
+
+
+  # DBConnection.Poolboy timeouts
+  @pool_timeout 5_000
+  @timeout 15_000
+
+  @read_queries [ReadQuery, CountQuery, AggregateQuery]
+
+
+  # == Ecto.Adapter Behavior == #
+
+  # This callback is invoked by ecto to allow for code injection.
   @doc false
   defmacro __before_compile__(env) do
     config = Module.get_attribute(env.module, :config)
@@ -382,9 +395,6 @@ defmodule Mongo.Ecto do
       defoverridable [__pool__: 0]
     end
   end
-
-  @pool_timeout 5_000
-  @timeout 15_000
 
   defp normalize_config(config) do
     config
@@ -404,6 +414,22 @@ defmodule Mongo.Ecto do
   @doc false
   def application, do: :mongodb_ecto
 
+
+  # This callback is invoked by ecto to ensure all applications necessary to
+  # run the adapter are started. In our case, we ensure that the connection pool
+  # and the mongodb adapter have started.
+  @doc false
+  def ensure_all_started(repo, type) do
+    {_, opts} = repo.__pool__
+    with {:ok, pool} <- DBConnection.ensure_all_started(opts, type),
+         {:ok, mongo} <- Application.ensure_all_started(:mongodb, type),
+      do: {:ok, pool ++ mongo}
+  end
+
+
+  # This callback is invoked by ecto and should return the childspec that starts the adapter process.
+  # In our case, we check to see if pool options should be overridden and then pass those options
+  # to the mongodb adapter's child_spec function.
   @doc false
   def child_spec(repo, opts) do
     # Check if the pool options should be overridden
@@ -419,14 +445,14 @@ defmodule Mongo.Ecto do
     Mongo.child_spec(opts)
   end
 
-  @doc false
-  def ensure_all_started(repo, type) do
-    {_, opts} = repo.__pool__
-    with {:ok, pool} <- DBConnection.ensure_all_started(opts, type),
-         {:ok, mongo} <- Application.ensure_all_started(:mongodb, type),
-      do: {:ok, pool ++ mongo}
-  end
 
+
+
+
+  # Loaders & Dumpers
+
+
+  # Loaders convert values from the database types into the types expected by Ecto.
   @doc false
   def loaders(:time,            type), do: [&load_time/1, type]
   def loaders(:date,            type), do: [&load_date/1, type]
@@ -464,6 +490,7 @@ defmodule Mongo.Ecto do
   end
   defp load_objectid(_), do: :error
 
+  # Dumpers convert values from the Ecto types into the types expected by the database.
   @doc false
   def dumpers(:time,           type), do: [type, &dump_time/1]
   def dumpers(:date,           type), do: [type, &dump_date/1]
@@ -550,6 +577,16 @@ defmodule Mongo.Ecto do
   end
   defp dump_objectid(_), do: :error
 
+
+
+
+
+
+
+  # Procedures
+
+
+  # Called to autogenerate a value for id/embed_id/binary_id.
   @doc false
   def autogenerate(:id),
     do: raise "MongoDB adapter does not support `:id` type as primary key"
@@ -558,19 +595,30 @@ defmodule Mongo.Ecto do
   def autogenerate(:binary_id),
     do: Mongo.object_id
 
+
+  # Command invoked to prepare a query for `all`, `update_all` and `delete_all`.
+  # The returned result is given to `execute/6`.
+  #
+  # No caching used for Mongodb.
   @doc false
   def prepare(function, query) do
     {:nocache, {function, query}}
   end
 
-  @read_queries [ReadQuery, CountQuery, AggregateQuery]
 
+
+
+  # Executes a previously prepared query.
+  # It must return a tuple containing the number of entries and
+  # the result set as a list of lists. The result set may also be
+  # `nil` if a particular operation does not support them.
   @doc false
-  def execute(repo, _meta, {:nocache, {function, query}}, params, process, opts) do
+  def execute(repo, _query_meta, {:nocache, {function, query}}, params, process, opts) do
     case apply(NormalizedQuery, function, [query, params]) do
       %{__struct__: read} = query when read in @read_queries ->
         {rows, count} =
-          Connection.read(repo, query, opts)
+          repo
+          |> Connection.read(query, opts)
           |> Enum.map_reduce(0, &{process_document(&1, query, process), &2 + 1})
         {count, rows}
       %WriteQuery{} = write ->
@@ -578,50 +626,6 @@ defmodule Mongo.Ecto do
         {result, nil}
     end
   end
-
-  @doc false
-  def insert(_repo, meta, _params, _on_conflict, [_|_] = returning, _opts) do
-    raise ArgumentError,
-      "MongoDB adapter does not support :read_after_writes in models. " <>
-      "The following fields in #{inspect meta.schema} are tagged as such: #{inspect returning}"
-  end
-
-  def insert(repo, meta, params, _, [], opts) do
-    normalized = NormalizedQuery.insert(meta, params)
-
-    case Connection.insert(repo, normalized, opts) do
-      {:ok, _} ->
-        {:ok, []}
-      other ->
-        other
-    end
-  end
-
-  def insert_all(repo, meta, fields, params, _, returning, opts) do
-    normalized = NormalizedQuery.insert(meta, params)
-
-    case Connection.insert_all(repo, normalized, opts) do
-      {:ok, _} ->
-        {:ok, []}
-      other ->
-        other
-    end
-  end
-
-  @doc false
-  def update(repo, meta, fields, filters, returning, opts) do
-    normalized = NormalizedQuery.update(meta, fields, filters)
-
-    Connection.update(repo, normalized, opts)
-  end
-
-  @doc false
-  def delete(repo, meta, filter, opts) do
-    normalized = NormalizedQuery.delete(meta, filter)
-
-    Connection.delete(repo, normalized, opts)
-  end
-
   defp process_document(document, %{fields: fields, pk: pk}, preprocess) do
     document = Conversions.to_ecto_pk(document, pk)
 
@@ -635,27 +639,94 @@ defmodule Mongo.Ecto do
     end)
   end
 
-  ## Storage
+  # Inserts a single new struct in the data store. Mongo does not support returning syntax.
+  @doc false
+  def insert(_repo, schema_meta, fields, _on_conflict, [_|_] = returning, _opts) do
+    raise ArgumentError,
+      "MongoDB adapter does not support :read_after_writes in models. " <>
+      "The following fields in #{inspect schema_meta.schema} are tagged as such: #{inspect returning}"
+  end
 
+  # Inserts a single new struct in the data store.
+  @doc false
+  def insert(repo, schema_meta, fields, _on_conflict, returning, opts) do
+    normalized = NormalizedQuery.insert(schema_meta, fields)
+
+    case Connection.insert(repo, normalized, opts) do
+      {:ok, _} ->
+        {:ok, []}
+      other ->
+        other
+    end
+  end
+
+  # Inserts multiple entries into the data store.
+  # TODO: Double check the names of these arguments and if they're still valid
+  @doc false
+  def insert_all(repo, schema_meta, fields, params, _on_conflict, returning, opts) do
+    normalized = NormalizedQuery.insert(schema_meta, params)
+
+    case Connection.insert_all(repo, normalized, opts) do
+      {:ok, _} ->
+        {:ok, []}
+      other ->
+        other
+    end
+  end
+
+  # Updates a single struct with the given filters.
+  @doc false
+  def update(repo, schema_meta, fields, filters, returning, opts) do
+    normalized = NormalizedQuery.update(schema_meta, fields, filters)
+
+    Connection.update(repo, normalized, opts)
+  end
+
+  # Deletes a single struct with the given filters.
+  @doc false
+  def delete(repo, schema_meta, filters, opts) do
+    normalized = NormalizedQuery.delete(schema_meta, filters)
+
+    Connection.delete(repo, normalized, opts)
+  end
+
+
+
+
+
+
+
+
+
+
+
+
+  # == Ecto.Adapter.Storage Behavior == #
+
+  # Creates the storage given by options.
   # Noop for MongoDB, as any databases and collections are created as needed.
   @doc false
   def storage_up(_opts) do
     :ok
   end
 
+  # Drops the storage given by options.
   @doc false
   def storage_down(opts) do
     Connection.storage_down(opts)
   end
 
-  ## Migration
 
-  alias Ecto.Migration.Table
-  alias Ecto.Migration.Index
 
+
+
+  # == Ecto.Adapter.Migration Behavior == #
+
+  # Mongodb does not return ddl transaction and so this method returns false.
   @doc false
   def supports_ddl_transaction?, do: false
 
+  # Executes migration commands.
   @doc false
   def execute_ddl(_repo, string, _opts) when is_binary(string) do
     raise ArgumentError, "MongoDB adapter does not support SQL statements in `execute`"
@@ -754,13 +825,20 @@ defmodule Mongo.Ecto do
     end
   end
 
-  #
-  # Transaction callbacks
-  #
 
+
+
+  # Transaction callbacks
   def in_transaction?(_repo), do: false
 
-  ## Mongo specific calls
+
+
+
+
+
+
+
+  # ==  Mongo specific calls == #
 
   @doc """
   Drops all the collections in current database.
@@ -825,11 +903,12 @@ defmodule Mongo.Ecto do
     all_collections -- [@migration]
   end
 
-  defp list_collections(_,repo, opts) do
+  defp list_collections(_, repo, opts) do
     query = %ReadQuery{coll: "system.namespaces", query: @list_collections_query}
     opts = Keyword.put(opts, :log, false)
 
-    Connection.read(repo, query, opts)
+    repo
+    |> Connection.read(query, opts)
     |> Enum.map(&Map.fetch!(&1, "name"))
     |> Enum.map(fn collection ->
       collection |> String.split(".", parts: 2) |> Enum.at(1)
